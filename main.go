@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +25,11 @@ var (
 	config    = flag.String("c", "/etc/wireguard/wg0.conf", "Path to main file config")
 	Interface = flag.String("i", "wg0", "Wireguard interface")
 )
+
+type peer struct {
+	peerName string
+	peerKey  string
+}
 
 type collector struct {
 	bytesReceived *prometheus.Desc
@@ -78,28 +82,31 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		panic(err)
 	}
 	defer file.Close()
-	keyToName := make(map[string]string)
-
+	peerNames := make(map[string]peer)
 	scanner := bufio.NewScanner(file)
-	var currentBlock string
 	inBlock := false
-
+	pubKey := ""
+	peername := ""
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "### begin ") && strings.HasSuffix(line, " ###") {
-			currentBlock = strings.TrimPrefix(line, "### begin ")
-			currentBlock = strings.TrimSuffix(currentBlock, " ###")
+		if strings.Contains(line, "[Peer]") && !inBlock {
+			// log.Println("Found peer block ...")
 			inBlock = true
-		} else if inBlock && strings.HasPrefix(line, "### end ") && strings.HasSuffix(line, " ###") {
+		} else if strings.Contains(line, "AllowedIPs") {
+			// log.Println("End of peer block")
 			inBlock = false
-			currentBlock = ""
-		} else if inBlock && strings.HasPrefix(line, "PublicKey = ") {
-			publicKey := strings.TrimPrefix(line, "PublicKey = ")
-			keyToName[publicKey] = currentBlock
+			peername = ""
+		} else if strings.Contains(line, "friendly_name") {
+			// log.Println("Found peer name ", strings.Split(line, "=")[1])
+			peername = strings.TrimSpace(strings.Split(line, "=")[1])
+		} else if strings.Contains(line, "PublicKey") {
+			// log.Println("Found public Key", strings.Split(line, "=")[1])
+			pubKey = strings.TrimSpace(strings.Split(line, "=")[1]) + "="
+			peerNames[pubKey] = peer{peerName: peername, peerKey: pubKey}
 		}
 	}
 
-	cmd := exec.Command("wg", "show", "all", "dump")
+	cmd := exec.Command("wg", "show", *Interface, "dump")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Error running command: %v\n", err)
@@ -114,17 +121,32 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 		count++
 		fields := strings.Fields(line)
-		interfaceName := fields[0]
-		publicKey := fields[1]
-		lasthandshake, _ := strconv.ParseFloat(fields[5], 64)
-		user_name, ok := keyToName[publicKey]
-		if !ok {
-			fmt.Println("error user name", publicKey)
-			return
+		interfaceName := *Interface
+		publicKey := fields[0]
+		lasthandshake, err := strconv.ParseFloat(fields[4], 64)
+		if err != nil {
+			log.Println("Error parsing lasthandshake:", err)
+			lasthandshake = 0
 		}
-		bytesReceived, _ := strconv.ParseFloat(fields[6], 64)
-		bytesSent, _ := strconv.ParseFloat(fields[7], 64)
+		// log.Println(peerNames)
+		user_name := peerNames[publicKey].peerName
+		log.Println("Checking key ", publicKey)
+		if user_name == "" {
+			log.Println("User name not set for key:", publicKey)
+		} else {
+			log.Println("User for key: ", publicKey, " is ", user_name)
+		}
 
+		bytesReceived, err := strconv.ParseFloat(fields[5], 64)
+		if err != nil {
+			log.Println("Error parsing bytes received:", err)
+			bytesReceived = 0
+		}
+		bytesSent, err := strconv.ParseFloat(fields[6], 64)
+		if err != nil {
+			log.Println("Error parsing bytes sent:", err)
+			bytesSent = 0
+		}
 		ch <- prometheus.MustNewConstMetric(
 			c.bytesReceived,
 			prometheus.CounterValue,
@@ -162,9 +184,9 @@ func main() {
 	endpoint := http.NewServeMux()
 	endpoint.Handle(*addr, promhttp.Handler())
 
-	log.Printf("starting WireGuard exporter on %q", *port, *addr)
-	log.Printf("Config path is :", *config)
-	log.Printf("Interface exporting is :", *Interface)
+	log.Println("starting WireGuard exporter on ", *port, *addr)
+	log.Println("Config path is :", *config)
+	log.Println("Interface exporting is :", *Interface)
 	s := &http.Server{
 		Addr:         *port,
 		Handler:      endpoint,
